@@ -1,0 +1,7 @@
+.vscode/**
+.vscode-test/**
+src/**
+.eslintrc.cjs
+tsconfig.json
+**/*.map
+**/.DS_Store
