@@ -24,15 +24,23 @@ interface PendingTurn {
   resolve: (text: string) => void
   reject: (error: Error) => void
   timer: NodeJS.Timeout
+  sessionToken: number
+  sentAt: number
+  ignoredGreeting: boolean
 }
 
 const TURN_TIMEOUT_MS = 45_000
+const GREETING_IGNORE_WINDOW_MS = 8_000
+const GREETING_MAX_LENGTH = 260
 
 export class ConvaiService {
   private readonly options: ConvaiServiceOptions
   private conversation: TextConversation | undefined
   private connectPromise: Promise<void> | undefined
   private pendingTurns: PendingTurn[] = []
+  private sessionToken = 0
+  private connectedAt = 0
+  private userMessagesSentInSession = 0
 
   constructor(options: ConvaiServiceOptions) {
     this.options = options
@@ -77,14 +85,23 @@ export class ConvaiService {
         reject(new Error('Timed out waiting for agent response.'))
       }, TURN_TIMEOUT_MS)
 
-      const pendingTurn: PendingTurn = { resolve, reject, timer }
+      const pendingTurn: PendingTurn = {
+        resolve,
+        reject,
+        timer,
+        sessionToken: this.sessionToken,
+        sentAt: Date.now(),
+        ignoredGreeting: false,
+      }
       this.pendingTurns.push(pendingTurn)
 
       try {
+        this.userMessagesSentInSession += 1
         convo.sendUserMessage(text)
       } catch (error) {
         clearTimeout(timer)
         this.pendingTurns = this.pendingTurns.filter((turn) => turn !== pendingTurn)
+        this.userMessagesSentInSession = Math.max(0, this.userMessagesSentInSession - 1)
         const message =
           error instanceof Error ? error.message : 'Failed to send message to agent.'
         reject(new Error(message))
@@ -137,6 +154,8 @@ export class ConvaiService {
       connectionType: 'websocket' as const,
       clientTools: this.buildClientTools(),
       onConnect: () => {
+        this.connectedAt = Date.now()
+        this.userMessagesSentInSession = 0
         this.options.onSystemMessage('ConvAI connected.')
       },
       onDisconnect: () => {
@@ -151,8 +170,13 @@ export class ConvaiService {
       onError: (message: string) => {
         this.options.onSystemMessage(`ConvAI error: ${message}`)
       },
-      onMessage: (payload: { source: 'user' | 'ai'; role: 'user' | 'agent'; message: string }) => {
-        if (payload.source !== 'ai' && payload.role !== 'agent') {
+      onMessage: (payload: {
+        source: 'user' | 'ai'
+        role: 'user' | 'agent'
+        message: string
+        event_id?: number
+      }) => {
+        if (payload.source !== 'ai' || payload.role !== 'agent') {
           return
         }
 
@@ -162,7 +186,7 @@ export class ConvaiService {
         }
 
         void this.options.onAssistantMessage(message)
-        this.resolvePendingTurn(message)
+        this.resolvePendingTurn(message, payload.event_id)
       },
       onUnhandledClientToolCall: (toolCall: { tool_name: string }) => {
         this.options.onSystemMessage(
@@ -175,6 +199,7 @@ export class ConvaiService {
       cfg.elevenLabsAgentId,
       cfg.elevenLabsApiKey
     )
+    this.sessionToken += 1
 
     if (signedUrl) {
       this.conversation = await Conversation.startSession({
@@ -263,9 +288,20 @@ export class ConvaiService {
     }
   }
 
-  private resolvePendingTurn(message: string): void {
+  private resolvePendingTurn(message: string, eventId?: number): void {
     const next = this.pendingTurns.shift()
     if (!next) {
+      return
+    }
+
+    if (next.sessionToken !== this.sessionToken) {
+      clearTimeout(next.timer)
+      next.reject(new Error('ConvAI session changed during this request. Please retry.'))
+      return
+    }
+
+    if (this.shouldIgnoreReconnectGreeting(next, message, eventId)) {
+      this.pendingTurns.unshift(next)
       return
     }
 
@@ -279,6 +315,47 @@ export class ConvaiService {
       clearTimeout(turn.timer)
       turn.reject(new Error(reason))
     }
+  }
+
+  private shouldIgnoreReconnectGreeting(
+    pendingTurn: PendingTurn,
+    message: string,
+    eventId?: number
+  ): boolean {
+    if (pendingTurn.ignoredGreeting) {
+      return false
+    }
+
+    const normalized = message.trim()
+    if (normalized.length === 0 || normalized.length > GREETING_MAX_LENGTH) {
+      return false
+    }
+
+    const recentlyConnected = Date.now() - this.connectedAt <= GREETING_IGNORE_WINDOW_MS
+    if (!recentlyConnected) {
+      return false
+    }
+
+    const messageIsEarly = Date.now() - pendingTurn.sentAt <= 6_000
+    if (!messageIsEarly) {
+      return false
+    }
+
+    const isLikelyGreeting =
+      /\b(what would you like help with|how can i help|ready when you are|i['’]m ready|say things like)\b/i.test(
+        normalized
+      ) || /^(looks like you'?re there|hello|hi|hey)\b/i.test(normalized)
+
+    if (!isLikelyGreeting) {
+      return false
+    }
+
+    if (typeof eventId === 'number' && eventId > 1 && this.userMessagesSentInSession > 1) {
+      return false
+    }
+
+    pendingTurn.ignoredGreeting = true
+    return true
   }
 
   private extractSearchQuery(parameters: unknown): string {
@@ -349,10 +426,14 @@ export class ConvaiService {
   }
 
   private ensureWebSocketPolyfill(): void {
-    if (typeof (globalThis as { WebSocket?: unknown }).WebSocket !== 'undefined') {
-      return
+    try {
+      if (typeof (globalThis as { WebSocket?: unknown }).WebSocket !== 'undefined') {
+        return
+      }
+      ;(globalThis as { WebSocket?: unknown }).WebSocket = WebSocketImpl as unknown
+    } catch {
+      // Keep startup resilient in runtimes with locked globals.
     }
-    ;(globalThis as { WebSocket?: unknown }).WebSocket = WebSocketImpl as unknown
   }
 
   private ensureBrowserCompatGlobals(): void {
@@ -363,44 +444,76 @@ export class ConvaiService {
       atob?: (value: string) => string
     }
 
-    if (typeof root.window === 'undefined') {
-      root.window = {}
+    try {
+      if (typeof root.window === 'undefined') {
+        Object.defineProperty(root, 'window', {
+          value: {},
+          configurable: true,
+          writable: true,
+        })
+      }
+    } catch {
+      // ignore
     }
 
-    const windowLike = root.window
-
-    if (typeof root.navigator === 'undefined') {
-      root.navigator = {}
+    const windowLike = (root.window ?? {}) as Record<string, unknown>
+    const existingNavigator = (root.navigator ?? {}) as Record<string, unknown>
+    const navigatorLike: Record<string, unknown> = {
+      userAgent:
+        typeof existingNavigator.userAgent === 'string' && existingNavigator.userAgent.length > 0
+          ? existingNavigator.userAgent
+          : 'vscode-doc-guardian/1.0',
+      product:
+        typeof existingNavigator.product === 'string'
+          ? existingNavigator.product
+          : 'VSCode',
+      onLine:
+        typeof existingNavigator.onLine === 'boolean'
+          ? existingNavigator.onLine
+          : true,
+      userAgentData: (existingNavigator.userAgentData as unknown) ?? undefined,
     }
 
-    const navigatorLike = root.navigator
-
-    if (typeof navigatorLike.userAgent !== 'string' || navigatorLike.userAgent.length === 0) {
-      navigatorLike.userAgent = 'vscode-doc-guardian/1.0'
-    }
-    if (typeof navigatorLike.product !== 'string') {
-      navigatorLike.product = 'VSCode'
-    }
-    if (typeof navigatorLike.onLine !== 'boolean') {
-      navigatorLike.onLine = true
-    }
-
-    if (typeof windowLike.navigator === 'undefined') {
-      windowLike.navigator = navigatorLike
+    try {
+      if (typeof root.navigator === 'undefined') {
+        Object.defineProperty(root, 'navigator', {
+          value: navigatorLike,
+          configurable: true,
+          writable: true,
+        })
+      }
+    } catch {
+      // ignore if runtime exposes readonly navigator
     }
 
-    if (typeof windowLike.addEventListener !== 'function') {
-      windowLike.addEventListener = () => {}
-    }
-    if (typeof windowLike.removeEventListener !== 'function') {
-      windowLike.removeEventListener = () => {}
+    try {
+      if (typeof windowLike.navigator === 'undefined') {
+        windowLike.navigator = root.navigator ?? navigatorLike
+      }
+    } catch {
+      // ignore
     }
 
-    if (typeof root.btoa !== 'function') {
-      root.btoa = (value: string) => Buffer.from(value, 'binary').toString('base64')
+    try {
+      if (typeof windowLike.addEventListener !== 'function') {
+        windowLike.addEventListener = () => {}
+      }
+      if (typeof windowLike.removeEventListener !== 'function') {
+        windowLike.removeEventListener = () => {}
+      }
+    } catch {
+      // ignore
     }
-    if (typeof root.atob !== 'function') {
-      root.atob = (value: string) => Buffer.from(value, 'base64').toString('binary')
+
+    try {
+      if (typeof root.btoa !== 'function') {
+        root.btoa = (value: string) => Buffer.from(value, 'binary').toString('base64')
+      }
+      if (typeof root.atob !== 'function') {
+        root.atob = (value: string) => Buffer.from(value, 'base64').toString('binary')
+      }
+    } catch {
+      // ignore
     }
   }
 }

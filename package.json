@@ -2,7 +2,7 @@
   "name": "doc-guardian",
   "displayName": "Doc Guardian",
   "description": "Search docs, monitor code quality in real-time, and chat while coding.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "yagnesh288",
   "license": "MIT",
   "engines": {

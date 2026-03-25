@@ -202,7 +202,7 @@ export class AssistantPanel implements vscode.Disposable {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${csp} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${csp} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${csp} data:; media-src ${csp} data: blob:;" />
   <title>Doc Guardian Assistant</title>
   <style>
     :root {
@@ -368,8 +368,8 @@ export class AssistantPanel implements vscode.Disposable {
       background: rgba(67, 24, 24, 0.34);
     }
     .intel {
-      display: grid;
-      grid-template-rows: 1fr 1fr;
+      display: flex;
+      flex-direction: column;
       gap: 10px;
       min-height: 0;
     }
@@ -378,6 +378,10 @@ export class AssistantPanel implements vscode.Disposable {
       grid-template-rows: auto 1fr;
       min-height: 0;
       overflow: hidden;
+      flex: 1;
+    }
+    .section.hidden {
+      display: none;
     }
     .section-title {
       font-size: 11px;
@@ -592,7 +596,7 @@ export class AssistantPanel implements vscode.Disposable {
     </section>
 
     <aside class="intel">
-      <section class="panel section">
+      <section class="panel section hidden" id="docsSection">
         <div class="panel-head">
           <span class="section-title">Latest Docs</span>
           <span class="panel-meta">Firecrawl</span>
@@ -673,6 +677,7 @@ export class AssistantPanel implements vscode.Disposable {
     const vscode = acquireVsCodeApi();
     const feed = document.getElementById('feed');
     const docsList = document.getElementById('docsList');
+    const docsSection = document.getElementById('docsSection');
     const findingsList = document.getElementById('findingsList');
     const status = document.getElementById('status');
     const sessionMeta = document.getElementById('sessionMeta');
@@ -872,8 +877,10 @@ export class AssistantPanel implements vscode.Disposable {
       if (!results || results.length === 0) {
         docsList.className = 'empty';
         docsList.textContent = 'No docs found for this query.';
+        docsSection.classList.add('hidden');
         return;
       }
+      docsSection.classList.remove('hidden');
       docsList.className = '';
       for (const doc of results) {
         const item = document.createElement('div');
@@ -948,9 +955,9 @@ export class AssistantPanel implements vscode.Disposable {
       } else if (msg.type === 'audio') {
         if (voiceEnabled && msg.base64Audio) {
           const audio = new Audio('data:' + (msg.mimeType || 'audio/mpeg') + ';base64,' + msg.base64Audio);
-          void audio.play().catch(() => {
-            // fallback to browser TTS if ElevenLabs audio playback fails
-            speakLocally(lastAssistantText);
+          void audio.play().catch((error) => {
+            const message = error && error.message ? error.message : 'Unknown playback error';
+            addMessage('system', 'ElevenLabs audio playback failed in webview: ' + message);
           });
         }
       } else if (msg.type === 'busy') {
@@ -968,6 +975,16 @@ export class AssistantPanel implements vscode.Disposable {
       if (!question) return;
       vscode.postMessage({ type: 'ask', question });
       questionEl.value = '';
+    });
+
+    questionEl.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        const question = questionEl.value.trim();
+        if (!question) return;
+        vscode.postMessage({ type: 'ask', question });
+        questionEl.value = '';
+      }
     });
 
     searchBtn.addEventListener('click', () => {

@@ -50,37 +50,47 @@ export function activate(context: vscode.ExtensionContext): void {
   monitorService.start()
   context.subscriptions.push(monitorService)
 
-  convaiService = new ConvaiService({
-    getCodeContext: async () => buildAssistantContext(latestQuestionForContext),
-    searchDocs: async (query) => docSearchService.searchDocs(query),
-    getMonitorFindings: () => getActiveMonitorFindings(),
-    onAssistantMessage: async (message) => {
-      const panel = AssistantPanel.getCurrent()
-      if (!panel) return
+  try {
+    convaiService = new ConvaiService({
+      getCodeContext: async () => buildAssistantContext(latestQuestionForContext),
+      searchDocs: async (query) => docSearchService.searchDocs(query),
+      getMonitorFindings: () => getActiveMonitorFindings(),
+      onAssistantMessage: async (message) => {
+        const panel = AssistantPanel.getCurrent()
+        if (!panel) return
 
-      panel.postAssistantMessage(message)
-      await maybeSpeak(panel, message, voiceService)
-    },
-    onSystemMessage: (message) => {
-      AssistantPanel.getCurrent()?.postSystemMessage(message)
-      output(message)
-    },
-    onDocs: (query, results) => {
-      AssistantPanel.getCurrent()?.postDocs(results)
-      const store = sessionStore
-      if (!store) return
-      const workspaceKey = store.getWorkspaceKey()
-      void store.addDocLookup(workspaceKey, query, results).catch((error) => {
-        output(`Session doc save failed: ${toMessage(error)}`)
-      })
-    },
-    onFindings: (findings) => {
-      AssistantPanel.getCurrent()?.postFindings(findings)
-    },
-    onStatusChange: (status) => {
-      output(`ConvAI status: ${status}`)
-    },
-  })
+        panel.postAssistantMessage(message)
+        await maybeSpeak(panel, message, voiceService)
+      },
+      onSystemMessage: (message) => {
+        AssistantPanel.getCurrent()?.postSystemMessage(message)
+        output(message)
+      },
+      onDocs: (query, results) => {
+        AssistantPanel.getCurrent()?.postDocs(results)
+        const store = sessionStore
+        if (!store) return
+        const workspaceKey = store.getWorkspaceKey()
+        void store.addDocLookup(workspaceKey, query, results).catch((error) => {
+          output(`Session doc save failed: ${toMessage(error)}`)
+        })
+      },
+      onFindings: (findings) => {
+        AssistantPanel.getCurrent()?.postFindings(findings)
+      },
+      onStatusChange: (status) => {
+        output(`ConvAI status: ${status}`)
+        if (status === 'connected' && sessionStore) {
+          const workspaceKey = sessionStore.getWorkspaceKey()
+          void syncContextToConvai(sessionStore, workspaceKey)
+          void publishPanelState(sessionStore, AssistantPanel.getCurrent())
+        }
+      },
+    })
+  } catch (error) {
+    convaiService = undefined
+    output(`ConvAI init failed: ${toMessage(error)}`)
+  }
   context.subscriptions.push(
     new vscode.Disposable(() => {
       convaiService?.dispose()
@@ -286,7 +296,22 @@ async function handleAskQuestion(
       await syncContextToConvai(store, workspaceKey)
     }
 
-    const answer = await convai.ask(question)
+    let answer: string
+    try {
+      answer = await convai.ask(question)
+    } catch (error) {
+      if (!isRecoverableConvaiDisconnect(error)) {
+        throw error
+      }
+
+      panel.postSystemMessage('ConvAI connection dropped. Reconnecting and retrying…')
+      output(`ConvAI dropped; retrying once: ${toMessage(error)}`)
+      await convai.ensureSession()
+      if (store && workspaceKey) {
+        await syncContextToConvai(store, workspaceKey)
+      }
+      answer = await convai.ask(question)
+    }
 
     if (store && workspaceKey) {
       await store.appendTurn(workspaceKey, 'assistant', answer)
@@ -1030,7 +1055,7 @@ function normalizeImportToken(value: string): string | undefined {
 }
 
 async function buildAssistantContext(question: string): Promise<AssistantContext> {
-  const editor = vscode.window.activeTextEditor
+  const editor = resolveContextEditor()
   if (!editor) {
     return {
       filePath: 'No active file',
@@ -1273,7 +1298,7 @@ async function uriExists(uri: vscode.Uri): Promise<boolean> {
 }
 
 function getActiveMonitorFindings(): MonitorFinding[] {
-  const editor = vscode.window.activeTextEditor
+  const editor = resolveContextEditor()
   if (!editor) return []
   return monitorService?.getFindingsForDocument(editor.document).slice(0, 12) ?? []
 }
@@ -1288,7 +1313,7 @@ function getSurroundingCode(editor: vscode.TextEditor): string {
 }
 
 function getSelectedText(): string | undefined {
-  const editor = vscode.window.activeTextEditor
+  const editor = resolveContextEditor()
   if (!editor) return undefined
 
   const text = editor.document.getText(editor.selection).trim()
@@ -1303,6 +1328,17 @@ function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown error'
 }
 
+function isRecoverableConvaiDisconnect(error: unknown): boolean {
+  const message = toMessage(error).toLowerCase()
+  return (
+    message.includes('session disconnected') ||
+    message.includes('not connected') ||
+    message.includes('connection closed') ||
+    message.includes('websocket') ||
+    message.includes('timed out waiting for agent response')
+  )
+}
+
 function truncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
   return `${text.slice(0, maxChars)}...`
@@ -1313,7 +1349,7 @@ function defaultProjectName(workspaceKey: string): string {
 }
 
 function inferEditorLanguageLabel(): string {
-  const editor = vscode.window.activeTextEditor
+  const editor = resolveContextEditor()
   if (!editor) return 'TypeScript'
 
   const language = editor.document.languageId
@@ -1330,6 +1366,17 @@ function inferEditorLanguageLabel(): string {
     default:
       return language
   }
+}
+
+function resolveContextEditor(): vscode.TextEditor | undefined {
+  const active = vscode.window.activeTextEditor
+  if (active && active.document.uri.scheme === 'file') {
+    return active
+  }
+
+  return vscode.window.visibleTextEditors.find(
+    (editor) => editor.document.uri.scheme === 'file'
+  )
 }
 
 interface DerivedProjectHints {
@@ -1581,8 +1628,12 @@ async function maybeSpeak(
     const audioBase64 = await voiceService.synthesize(text)
     if (audioBase64) {
       panel.postAudio(audioBase64, 'audio/mpeg')
+      return
     }
+    panel.postSystemMessage('ElevenLabs TTS returned empty audio.')
   } catch (error) {
-    output(`Voice playback failed: ${toMessage(error)}`)
+    const message = toMessage(error)
+    panel.postSystemMessage(`ElevenLabs TTS failed: ${message}`)
+    output(`Voice playback failed: ${message}`)
   }
 }
