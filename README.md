@@ -25,6 +25,8 @@ When you ask a question, Doc Guardian can provide context from:
 - Diagnostics (errors/warnings)
 - Monitor findings
 - Files mentioned in your prompt (`src/App.tsx`, `server/index.ts`, `package.json`, etc.)
+- Local files imported by the active file (for example `./toolbar`, `./ui`, `./submit`)
+- Workspace-wide high-signal files when you ask for project scans like “scan all files” or “scan whole workspace”
 
 ### 2) Firecrawl-powered docs search
 The assistant uses Firecrawl to fetch live docs/search results and surfaces relevant references directly in the panel.
@@ -46,6 +48,9 @@ When issues appear, it can auto-fetch related docs in the background and show al
 ### 5) Voice workflow
 - **Voice input** via in-panel dictation (when runtime supports Web Speech APIs)
 - **Voice output** via ElevenLabs TTS (assistant replies are spoken when enabled)
+- Playback is queued to avoid overlapping responses
+- First startup greeting is not voiced before your first user question
+- Webview voice playback auto-unlocks after one user interaction in the panel (click/key)
 
 ### 6) Reconnect-safe ConvAI flow
 If ConvAI drops, Doc Guardian reconnects, re-syncs context, and retries the turn to preserve continuity.
@@ -136,7 +141,7 @@ Install `Doc Guardian` from VS Code Extensions panel.
 
 ## Option B: Install from VSIX
 ```bash
-code --install-extension doc-guardian-0.1.4.vsix --force
+code --install-extension doc-guardian-0.1.5.vsix --force
 ```
 
 ## Option C: Local Development
@@ -239,6 +244,10 @@ Usually quota/credits issue or invalid API key.
 Speech recognition depends on webview runtime support.
 Use text input if unavailable.
 
+## "ElevenLabs audio playback failed in webview: play() can only be initiated by a user gesture"
+Click once inside the assistant panel, then ask again.  
+From `0.1.5`, audio playback is queued/unlocked with user interaction to handle this browser policy.
+
 ## "command 'docGuardian.openAssistant' not found"
 Reload and reinstall latest extension build:
 - `Developer: Reload Window`
@@ -295,12 +304,15 @@ Requirements:
 
 ## Status
 
-Current packaged release line: **0.1.4**
+Current packaged release line: **0.1.5**
 
 Key recent reliability improvements:
 - reconnect-safe ask flow
 - context re-sync on reconnect
 - improved handling of post-reconnect greeting noise
+- queued voice playback to prevent overlap
+- user-gesture audio unlock support for webview playback
+- imported-file + workspace-wide context expansion (not limited to open tabs)
 
 ---
 
