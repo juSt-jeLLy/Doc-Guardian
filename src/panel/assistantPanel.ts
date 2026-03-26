@@ -711,6 +711,12 @@ export class AssistantPanel implements vscode.Disposable {
     const MESSAGE_WINDOW_LIMIT = 40;
     const FEED_LIMIT = 140;
     let panelState = null;
+    let userMessageCount = 0;
+    let hasUserGestureForAudio = false;
+    let hasShownAudioGestureHint = false;
+    let activeAudio = null;
+    let isAudioPlaying = false;
+    const audioQueue = [];
 
     function addMessage(role, text) {
       const normalized = (text || '').trim();
@@ -725,6 +731,9 @@ export class AssistantPanel implements vscode.Disposable {
       div.className = 'msg ' + role;
       if (role === 'system' && /fail|error|cannot|timed out/i.test(normalized)) {
         div.className += ' error';
+      }
+      if (role === 'user') {
+        userMessageCount += 1;
       }
       div.textContent = normalized;
       feed.appendChild(div);
@@ -832,16 +841,78 @@ export class AssistantPanel implements vscode.Disposable {
       }
     }
 
-    function speakLocally(text) {
-      if (!('speechSynthesis' in window) || !voiceEnabled) return;
+    function markAudioGesture() {
+      if (hasUserGestureForAudio) return;
+      hasUserGestureForAudio = true;
+      hasShownAudioGestureHint = false;
+      drainAudioQueue();
+    }
+
+    function stopActiveAudio() {
+      if (!activeAudio) return;
       try {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance((text || '').slice(0, 900));
-        utterance.rate = 1;
-        utterance.pitch = 0.95;
-        utterance.volume = 1;
-        window.speechSynthesis.speak(utterance);
+        activeAudio.pause();
+        activeAudio.currentTime = 0;
       } catch {}
+      activeAudio = null;
+      isAudioPlaying = false;
+    }
+
+    function enqueueAudio(base64Audio, mimeType) {
+      if (!base64Audio) return;
+      audioQueue.push({
+        base64Audio,
+        mimeType: mimeType || 'audio/mpeg',
+      });
+      drainAudioQueue();
+    }
+
+    function drainAudioQueue() {
+      if (!voiceEnabled || isAudioPlaying || audioQueue.length === 0) return;
+
+      if (!hasUserGestureForAudio) {
+        if (!hasShownAudioGestureHint) {
+          hasShownAudioGestureHint = true;
+          addMessage('system', 'Voice is ready. Click once inside this panel to enable audio playback.');
+        }
+        return;
+      }
+
+      const next = audioQueue.shift();
+      if (!next) return;
+
+      const audio = new Audio('data:' + next.mimeType + ';base64,' + next.base64Audio);
+      activeAudio = audio;
+      isAudioPlaying = true;
+
+      const finish = () => {
+        if (activeAudio === audio) {
+          activeAudio = null;
+        }
+        isAudioPlaying = false;
+        drainAudioQueue();
+      };
+
+      audio.addEventListener('ended', finish, { once: true });
+      audio.addEventListener('error', () => {
+        addMessage('system', 'ElevenLabs audio playback failed in webview: audio decode/playback error.');
+        finish();
+      }, { once: true });
+
+      void audio.play().catch((error) => {
+        const message = error && error.message ? error.message : 'Unknown playback error';
+        if (/user gesture/i.test(message) || /notallowed/i.test(message)) {
+          hasUserGestureForAudio = false;
+          audioQueue.unshift(next);
+          if (!hasShownAudioGestureHint) {
+            hasShownAudioGestureHint = true;
+            addMessage('system', 'Click once inside this panel to enable voice playback.');
+          }
+        } else {
+          addMessage('system', 'ElevenLabs audio playback failed in webview: ' + message);
+        }
+        finish();
+      });
     }
 
     function initSpeechRecognition() {
@@ -953,13 +1024,10 @@ export class AssistantPanel implements vscode.Disposable {
       } else if (msg.type === 'panelState') {
         applyPanelState(msg);
       } else if (msg.type === 'audio') {
-        if (voiceEnabled && msg.base64Audio) {
-          const audio = new Audio('data:' + (msg.mimeType || 'audio/mpeg') + ';base64,' + msg.base64Audio);
-          void audio.play().catch((error) => {
-            const message = error && error.message ? error.message : 'Unknown playback error';
-            addMessage('system', 'ElevenLabs audio playback failed in webview: ' + message);
-          });
-        }
+        // Skip the startup assistant intro before the first real user turn.
+        if (userMessageCount === 0) return;
+        if (!voiceEnabled || !msg.base64Audio) return;
+        enqueueAudio(msg.base64Audio, msg.mimeType);
       } else if (msg.type === 'busy') {
         status.textContent = msg.busy ? 'Thinking…' : 'Ready';
         status.classList.toggle('busy', !!msg.busy);
@@ -970,6 +1038,7 @@ export class AssistantPanel implements vscode.Disposable {
     });
 
     askForm.addEventListener('submit', (event) => {
+      markAudioGesture();
       event.preventDefault();
       const question = questionEl.value.trim();
       if (!question) return;
@@ -978,6 +1047,7 @@ export class AssistantPanel implements vscode.Disposable {
     });
 
     questionEl.addEventListener('keydown', (event) => {
+      markAudioGesture();
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         const question = questionEl.value.trim();
@@ -988,12 +1058,14 @@ export class AssistantPanel implements vscode.Disposable {
     });
 
     searchBtn.addEventListener('click', () => {
+      markAudioGesture();
       const query = questionEl.value.trim();
       if (!query) return;
       vscode.postMessage({ type: 'searchDocs', query });
     });
 
     dictateBtn.addEventListener('click', () => {
+      markAudioGesture();
       if (!recognition) {
         addMessage('system', 'Speech recognition is not available in this VS Code runtime.');
         return;
@@ -1006,12 +1078,19 @@ export class AssistantPanel implements vscode.Disposable {
     });
 
     voiceToggleBtn.addEventListener('click', () => {
+      markAudioGesture();
       voiceEnabled = !voiceEnabled;
       voiceToggleBtn.textContent = voiceEnabled ? 'Mute Voice' : 'Unmute Voice';
-      if (!voiceEnabled && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
+      if (!voiceEnabled) {
+        stopActiveAudio();
+        audioQueue.length = 0;
+      } else {
+        drainAudioQueue();
       }
     });
+
+    window.addEventListener('pointerdown', markAudioGesture, { once: true });
+    window.addEventListener('keydown', markAudioGesture, { once: true });
 
     setContextBtn.addEventListener('click', () => {
       toggleContextEditor();

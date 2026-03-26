@@ -31,6 +31,12 @@ const lastBackgroundAlertBySignature = new Map<string, number>()
 const MAX_REFERENCED_FILES = 10
 const MAX_FILE_CONTENT_CHARS = 10_000
 const MAX_TOTAL_REFERENCED_CHARS = 45_000
+const MAX_IMPORTED_REFERENCED_FILES = 8
+const MAX_WORKSPACE_REFERENCED_FILES = 8
+const WORKSPACE_SCAN_INCLUDE_GLOB =
+  '**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,kt,swift,php,rb,json,yaml,yml,md}'
+const WORKSPACE_SCAN_EXCLUDE_GLOB =
+  '**/{node_modules,dist,.next,.git,out,build,.turbo,.cache,coverage,.venv,venv,target,.idea}/**'
 
 type BackgroundWatchScope = 'active' | 'workspace'
 
@@ -1129,6 +1135,18 @@ async function collectReferencedFilesForContext(
     addSpec(path, 'mentioned')
   }
 
+  const importedFilePaths = await resolveImportedLocalFilePaths(activeDocument)
+  for (const path of importedFilePaths) {
+    addSpec(path, 'imported')
+  }
+
+  if (shouldIncludeWorkspaceWideContext(question)) {
+    const workspaceFilePaths = await resolveWorkspaceWideFilePaths(activeDocument.uri.fsPath)
+    for (const path of workspaceFilePaths) {
+      addSpec(path, 'workspace')
+    }
+  }
+
   const contexts: ReferencedFileContext[] = []
   let totalChars = 0
   for (const spec of fileSpecs.slice(0, MAX_REFERENCED_FILES)) {
@@ -1148,6 +1166,128 @@ async function collectReferencedFilesForContext(
   }
 
   return contexts
+}
+
+async function resolveImportedLocalFilePaths(
+  activeDocument: vscode.TextDocument
+): Promise<string[]> {
+  const specifiers = extractLocalImportSpecifiers(activeDocument).slice(
+    0,
+    MAX_IMPORTED_REFERENCED_FILES
+  )
+  const resolved: string[] = []
+
+  for (const specifier of specifiers) {
+    const path = await resolveRelativeImportCandidate(specifier, activeDocument.uri.fsPath)
+    if (!path) continue
+    if (resolved.includes(path)) continue
+    resolved.push(path)
+    if (resolved.length >= MAX_IMPORTED_REFERENCED_FILES) break
+  }
+
+  return resolved
+}
+
+function extractLocalImportSpecifiers(document: vscode.TextDocument): string[] {
+  const text = document.getText().slice(0, 18_000)
+  const specifiers = new Set<string>()
+
+  for (const match of text.matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+    const specifier = (match[1] ?? '').trim()
+    if (specifier.startsWith('.')) {
+      specifiers.add(specifier)
+    }
+  }
+
+  for (const match of text.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+    const specifier = (match[1] ?? '').trim()
+    if (specifier.startsWith('.')) {
+      specifiers.add(specifier)
+    }
+  }
+
+  for (const match of text.matchAll(/import\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+    const specifier = (match[1] ?? '').trim()
+    if (specifier.startsWith('.')) {
+      specifiers.add(specifier)
+    }
+  }
+
+  return Array.from(specifiers)
+}
+
+async function resolveRelativeImportCandidate(
+  specifier: string,
+  activeFilePath: string
+): Promise<string | undefined> {
+  const cleanSpecifier = specifier.replace(/[?#].*$/, '').trim()
+  if (!cleanSpecifier) return undefined
+
+  const activeDirPath = path.dirname(activeFilePath)
+  const basePath = path.resolve(activeDirPath, cleanSpecifier)
+  const candidates: string[] = [basePath]
+  const ext = path.extname(basePath)
+
+  if (!ext) {
+    const extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.md']
+    for (const extension of extensions) {
+      candidates.push(`${basePath}${extension}`)
+    }
+    for (const extension of extensions) {
+      candidates.push(path.join(basePath, `index${extension}`))
+    }
+  }
+
+  for (const candidate of candidates) {
+    const uri = vscode.Uri.file(candidate)
+    if (await uriExists(uri)) {
+      return uri.fsPath
+    }
+  }
+
+  return undefined
+}
+
+function shouldIncludeWorkspaceWideContext(question: string): boolean {
+  const normalized = question.trim().toLowerCase()
+  if (!normalized) return false
+
+  return (
+    /\b(scan|check|review|analy[sz]e|audit|inspect)\b/.test(normalized) &&
+    /\b(all|other|whole|entire|workspace|repo|project|codebase)\b/.test(normalized)
+  )
+}
+
+async function resolveWorkspaceWideFilePaths(activeFilePath: string): Promise<string[]> {
+  const candidates = await vscode.workspace.findFiles(
+    WORKSPACE_SCAN_INCLUDE_GLOB,
+    WORKSPACE_SCAN_EXCLUDE_GLOB,
+    120
+  )
+
+  const scored = candidates
+    .map((uri) => uri.fsPath)
+    .filter((filePath) => filePath !== activeFilePath)
+    .map((filePath) => ({ filePath, score: scoreWorkspacePath(filePath) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_WORKSPACE_REFERENCED_FILES)
+
+  return scored.map((item) => item.filePath)
+}
+
+function scoreWorkspacePath(filePath: string): number {
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase()
+  let score = 0
+
+  if (normalized.includes('/src/')) score += 6
+  if (normalized.includes('/app/')) score += 5
+  if (normalized.endsWith('/package.json')) score += 10
+  if (normalized.endsWith('/tsconfig.json')) score += 9
+  if (normalized.endsWith('/readme.md')) score += 8
+  if (/\/(index|main|app)\.(ts|tsx|js|jsx)$/.test(normalized)) score += 7
+  if (/\/(api|routes|route|controller|service|hook|hooks)\//.test(normalized)) score += 5
+
+  return score
 }
 
 async function resolveMentionedFilePaths(

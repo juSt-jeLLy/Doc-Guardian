@@ -31,7 +31,7 @@ export interface AssistantContext {
 export interface ReferencedFileContext {
   filePath: string
   languageId: string
-  source: 'active' | 'visible' | 'mentioned'
+  source: 'active' | 'visible' | 'mentioned' | 'imported' | 'workspace'
   content: string
   truncated: boolean
 }
